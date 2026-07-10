@@ -56,6 +56,21 @@ class Stage1Response(BaseModel):
     source: Literal["llm", "heuristic"]
 
 
+class MediaStage1Response(BaseModel):
+    media_id: UUID
+    session_id: UUID
+    status: Literal["extracted", "skipped_already_extracted", "failed"]
+    node_count: int = 0
+    source: Optional[Literal["llm", "heuristic"]] = None
+
+
+class ProcessPendingResponse(BaseModel):
+    processed: int
+    skipped: int
+    failed: int
+    results: list[MediaStage1Response]
+
+
 def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     """Simple shared-secret check so random internet traffic can't
     write to your database once this is deployed publicly."""
@@ -264,6 +279,50 @@ def save_stage1_nodes(
         _insert_provenance(session_id, media_id, media_type, node, id_column, entity_id, preferred_model)
 
 
+def process_media_stage1(
+    media_id: UUID, preferred_model: Optional[str] = None
+) -> MediaStage1Response:
+    media_row = (
+        supabase.table("media")
+        .select("id, session_id, media_type, transcript_text, processing_status")
+        .eq("id", str(media_id))
+        .execute()
+    )
+    if not media_row.data:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    row = media_row.data[0]
+    session_id = UUID(str(row["session_id"]))
+
+    if row["processing_status"] == "extracted":
+        return MediaStage1Response(
+            media_id=media_id, session_id=session_id, status="skipped_already_extracted"
+        )
+
+    try:
+        _stage1_nodes, source, raw_nodes = build_stage1_nodes(
+            row.get("transcript_text") or "", preferred_model=preferred_model
+        )
+        save_stage1_nodes(session_id, media_id, row["media_type"], raw_nodes, preferred_model)
+    except Exception:
+        supabase.table("media").update({"processing_status": "failed"}).eq(
+            "id", str(media_id)
+        ).execute()
+        return MediaStage1Response(media_id=media_id, session_id=session_id, status="failed")
+
+    supabase.table("media").update({"processing_status": "extracted"}).eq(
+        "id", str(media_id)
+    ).execute()
+
+    return MediaStage1Response(
+        media_id=media_id,
+        session_id=session_id,
+        status="extracted",
+        node_count=len(raw_nodes),
+        source=source,
+    )
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -308,6 +367,38 @@ def create_stage1_nodes(payload: Stage1Request) -> Stage1Response:
         media_id = payload.media_id or uuid4()
 
     return Stage1Response(session_id=session_id, media_id=media_id, nodes=nodes, source=source)
+
+
+@app.post(
+    "/media/{media_id}/stage1",
+    response_model=MediaStage1Response,
+    dependencies=[Depends(verify_api_key)],
+)
+def create_stage1_nodes_for_media(
+    media_id: UUID, model: Optional[str] = None
+) -> MediaStage1Response:
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+    return process_media_stage1(media_id, preferred_model=model)
+
+
+@app.post(
+    "/media/process-pending",
+    response_model=ProcessPendingResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+def process_pending_media() -> ProcessPendingResponse:
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+
+    pending = supabase.table("media").select("id").eq("processing_status", "transcribed").execute()
+
+    results = [process_media_stage1(UUID(str(row["id"]))) for row in pending.data]
+    processed = sum(1 for r in results if r.status == "extracted")
+    skipped = sum(1 for r in results if r.status == "skipped_already_extracted")
+    failed = sum(1 for r in results if r.status == "failed")
+
+    return ProcessPendingResponse(processed=processed, skipped=skipped, failed=failed, results=results)
 
 
 def build_stage1_nodes(
