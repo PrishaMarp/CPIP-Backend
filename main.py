@@ -1,5 +1,6 @@
+import hmac
 import os
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID, uuid4
 
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 API_KEY = os.getenv("API_KEY", "dev-key")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
@@ -71,13 +73,27 @@ class ProcessPendingResponse(BaseModel):
     results: list[MediaStage1Response]
 
 
+class SupabaseWebhookPayload(BaseModel):
+    type: str
+    table: str
+    record: dict[str, Any]
+    old_record: Optional[dict[str, Any]] = None
+
+
 def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     """Simple shared-secret check so random internet traffic can't
     write to your database once this is deployed publicly."""
-    if x_api_key is None:
-        return
-    if API_KEY and x_api_key != API_KEY:
+    if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def verify_webhook_secret(x_webhook_secret: Optional[str] = Header(default=None)) -> None:
+    """Confirms this request actually came from the Supabase Database
+    Webhook, not random internet traffic hitting a guessable endpoint."""
+    if not WEBHOOK_SECRET or not x_webhook_secret or not hmac.compare_digest(
+        x_webhook_secret, WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
 def extract_stage1_nodes(
@@ -462,6 +478,22 @@ def process_pending_media() -> ProcessPendingResponse:
     failed = sum(1 for r in results if r.status == "failed")
 
     return ProcessPendingResponse(processed=processed, skipped=skipped, failed=failed, results=results)
+
+
+@app.post(
+    "/extract",
+    dependencies=[Depends(verify_webhook_secret)],
+)
+def extract_from_webhook(payload: SupabaseWebhookPayload) -> dict[str, Any]:
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Supabase is not configured")
+
+    if payload.type != "INSERT" or payload.table != "media":
+        return {"ignored": True, "type": payload.type, "table": payload.table}
+
+    media_id = UUID(str(payload.record["id"]))
+    result = process_media_stage1(media_id)
+    return result.model_dump(mode="json")
 
 
 def build_stage1_nodes(
