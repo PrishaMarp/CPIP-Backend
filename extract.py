@@ -5,35 +5,159 @@ import urllib.error
 import urllib.request
 from typing import Any, Literal, Optional
 
-SYSTEM_PROMPT = """You are a psychologist working in clinical and behavioral health research, helping analyze interview transcripts about people navigating healthcare, justice, recovery, and social service systems.
+SYSTEM_PROMPT = """You are coding qualitative interview transcripts describing a person's journey through systems related to opioid use, treatment, and recovery. Your job is to identify the STATES the person passed through, the TRANSITIONS between those states, and any BARRIERS or FACILITATORS that affected those states or transitions.
 
-Read the transcript carefully and identify every meaningful span of text that represents one of these entity types:
+DEFINITIONS
 
-- state: A place, program, or situation a person visits or is in (for example: went to the ER, enrolled in drug court, released from prison, in a shelter, started outpatient treatment)
-- barrier: A factor that blocked, delayed, or prevented access to a service or transition (for example: couldn't afford the copay, no transportation, waitlist was 6 months, didn't know the program existed, lost insurance)
-- facilitator: A factor that helped or accelerated a transition or access to a service (for example: case manager helped me, church provided a ride, doctor wrote a referral, peer support worker connected me)
+A STATE is a status, location, or condition the person was in — a point in their journey, not an action. Every state must have a state_type:
+- clinical: medical care, hospitals, prescribing providers, MAT clinics
+- justice: courts, jail, probation, legal involvement
+- recovery: peer support, sober living, recovery programs
+- social_service: harm reduction orgs, patient navigators, county services, housing
+- risk_event: overdose, withdrawal, relapse episode, crisis moment
+- administrative: insurance status, paperwork, waitlists, eligibility processes
 
-Rules:
-- Extract all relevant spans, even if they seem minor.
-- Use the exact words from the transcript for the excerpt field.
-- span_start and span_end are character offsets into the original transcript (0-indexed).
-- label should be a short 2-5 word phrase that names the entity.
-- confidence is your certainty this is a real entity (0.0-1.0). Use less than 0.7 if you are unsure.
-- Do not invent information. Only use what is in the transcript.
-- Return only a valid JSON array. No explanation, no markdown, no preamble.
+A TRANSITION is a move from one state to another, with a transition_type:
+- referral: formally referred from one provider/system to another
+- discharge: released or exited from a state (e.g. discharged from ER)
+- relapse: return to substance use after a period of recovery
+- reentry: returning to a system after having left it (e.g. reentry to treatment after a gap)
+- dropout: disengaged or stopped participating without formal discharge
+- handoff: informal transfer of care or information between people/systems
 
-Each item must follow this exact structure:
-{
-  "entity_type": "state" | "barrier" | "facilitator",
-  "label": "short label here",
-  "description": "one sentence explaining what this represents",
-  "excerpt": "exact quote from the transcript (max 200 characters)",
-  "span_start": 0,
-  "span_end": 50,
-  "confidence": 0.92
-}"""
+A BARRIER is something that impeded the person's progress, with a barrier_type:
+- structural: systemic issues like understaffing, policy gaps, eligibility rules
+- financial: cost, insurance, ability to pay
+- logistical: transportation, scheduling, wait times, distance
+- stigma: judgment, shame, fear of consequences from disclosure
+- knowledge: not knowing a resource exists, unclear information
+- social: relationships, lack of support, family/social dynamics
 
-PROMPT_VERSION = "v1"
+A FACILITATOR is something that helped the person's progress, with a facilitator_type:
+- person: an individual who helped (peer, provider, family member, staff)
+- program: a specific service or program that helped
+- policy: a rule or policy that enabled access (e.g. walk-in policy, no insurance required)
+- resource: a material resource (transportation voucher, printed materials, phone)
+- relationship: an existing relationship or connection that enabled access
+
+CRITICAL RULES
+
+1. For every state, transition, barrier, and facilitator you extract, you MUST include an "evidence_text" field containing an EXACT VERBATIM QUOTE from the transcript that supports it. Do not paraphrase or summarize — copy the exact words. This is required for source traceability.
+2. Only extract what is actually supported by the text. Do not infer states, transitions, barriers, or facilitators that aren't clearly present.
+3. Assign severity (barriers) / impact (facilitators) as minor/moderate/major, and risk_level (transitions) as low/medium/high/critical, based on how the person describes the consequence — err toward "moderate"/"medium" if genuinely ambiguous.
+4. A barrier or facilitator should be linked to either a state OR a transition, not both — pick whichever it most directly affected, and put that element's temp_id in the "affects" field.
+5. Use temp_id values (e.g. "s1", "t1", "b1", "f1") to reference elements within your own response only — these are local identifiers, not permanent IDs. Transitions reference states via "from_state"/"to_state" temp_ids.
+
+EXAMPLE
+
+Transcript excerpt: "I called all three. One wasn't taking new patients. One wanted like eight hundred dollars for an intake because they didn't take my insurance. The third one, the wait was six weeks out."
+
+Correct extraction includes a barrier:
+{"temp_id": "b1", "label": "High cost of intake without insurance", "barrier_type": "financial", "severity": "major", "evidence_text": "One wanted like eight hundred dollars for an intake because they didn't take my insurance."}
+
+and a second barrier:
+{"temp_id": "b2", "label": "Long wait time for clinic intake", "barrier_type": "logistical", "severity": "major", "evidence_text": "the wait was six weeks out"}
+
+Return a JSON object with this exact top-level shape: {"states": [...], "transitions": [...], "barriers": [...], "facilitators": [...]}. Include a "confidence" field (0.0-1.0) on every item."""
+
+RESPONSE_JSON_SCHEMA = {
+    "name": "transcript_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "states": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "temp_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "state_type": {
+                            "type": "string",
+                            "enum": ["clinical", "justice", "recovery", "social_service", "risk_event", "administrative"],
+                        },
+                        "evidence_text": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["temp_id", "label", "state_type", "evidence_text", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+            "transitions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "temp_id": {"type": "string"},
+                        "from_state": {"type": "string"},
+                        "to_state": {"type": "string"},
+                        "transition_type": {
+                            "type": "string",
+                            "enum": ["referral", "discharge", "relapse", "reentry", "dropout", "handoff"],
+                        },
+                        "risk_level": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                        "evidence_text": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": [
+                        "temp_id", "from_state", "to_state", "transition_type", "risk_level",
+                        "evidence_text", "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "barriers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "temp_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "barrier_type": {
+                            "type": "string",
+                            "enum": ["structural", "financial", "logistical", "stigma", "knowledge", "social"],
+                        },
+                        "severity": {"type": "string", "enum": ["minor", "moderate", "major"]},
+                        "affects": {"type": "string"},
+                        "evidence_text": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": [
+                        "temp_id", "label", "barrier_type", "severity", "affects", "evidence_text", "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "facilitators": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "temp_id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "facilitator_type": {
+                            "type": "string",
+                            "enum": ["person", "program", "policy", "resource", "relationship"],
+                        },
+                        "impact": {"type": "string", "enum": ["minor", "moderate", "major"]},
+                        "affects": {"type": "string"},
+                        "evidence_text": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": [
+                        "temp_id", "label", "facilitator_type", "impact", "affects", "evidence_text", "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["states", "transitions", "barriers", "facilitators"],
+        "additionalProperties": False,
+    },
+}
+
+PROMPT_VERSION = "v2"
 
 
 def extract_stage1_nodes(
@@ -44,9 +168,10 @@ def extract_stage1_nodes(
 
     if _llm_configured():
         try:
-            raw_nodes = _extract_with_llm(transcript_text, preferred_model=preferred_model)
-            if raw_nodes:
-                return [_normalize_llm_node(node) for node in raw_nodes], "llm"
+            raw_result = _extract_with_llm(transcript_text, preferred_model=preferred_model)
+            nodes = _flatten_llm_result(raw_result)
+            if nodes:
+                return nodes, "llm"
         except Exception:
             pass
 
@@ -54,30 +179,82 @@ def extract_stage1_nodes(
     return heuristic_nodes, "heuristic"
 
 
-def _normalize_llm_node(node: dict[str, Any]) -> dict[str, Any]:
-    entity_type = (node.get("entity_type") or node.get("category") or "state").strip().lower()
-    category = _map_entity_type(entity_type)
-    excerpt = node.get("excerpt") or node.get("text") or ""
-    normalized_text = _normalize_node_text(excerpt, category)
-    return {
-        "text": normalized_text or excerpt,
-        "category": category,
-        "evidence": excerpt,
-        "confidence": float(node.get("confidence", 0.75)),
-        "description": node.get("description"),
-        "span_start": node.get("span_start"),
-        "span_end": node.get("span_end"),
-    }
+def _flatten_llm_result(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flattens the LLM's {states, transitions, barriers, facilitators} object
+    into the unified node-dict shape main.py persists, preserving temp_id
+    references so relationships (transition endpoints, affected state/transition)
+    can be resolved to real DB ids after states/transitions are inserted."""
+    nodes: list[dict[str, Any]] = []
 
+    for state in result.get("states", []):
+        nodes.append({
+            "temp_id": state.get("temp_id"),
+            "text": state.get("label", ""),
+            "category": "state",
+            "evidence": state.get("evidence_text", ""),
+            "confidence": float(state.get("confidence", 0.75)),
+            "description": None,
+            "span_start": None,
+            "span_end": None,
+            "type": state.get("state_type"),
+            "impact": None,
+            "affects_temp_id": None,
+            "from_temp_id": None,
+            "to_temp_id": None,
+        })
 
-def _map_entity_type(entity_type: str) -> str:
-    if entity_type == "barrier":
-        return "barrier"
-    if entity_type == "facilitator":
-        return "facilitator"
-    if entity_type == "state":
-        return "state"
-    return "event"
+    for transition in result.get("transitions", []):
+        nodes.append({
+            "temp_id": transition.get("temp_id"),
+            "text": transition.get("transition_type", "transition"),
+            "category": "transition",
+            "evidence": transition.get("evidence_text", ""),
+            "confidence": float(transition.get("confidence", 0.75)),
+            "description": None,
+            "span_start": None,
+            "span_end": None,
+            "type": transition.get("transition_type"),
+            "impact": transition.get("risk_level"),
+            "affects_temp_id": None,
+            "from_temp_id": transition.get("from_state"),
+            "to_temp_id": transition.get("to_state"),
+        })
+
+    for barrier in result.get("barriers", []):
+        nodes.append({
+            "temp_id": barrier.get("temp_id"),
+            "text": barrier.get("label", ""),
+            "category": "barrier",
+            "evidence": barrier.get("evidence_text", ""),
+            "confidence": float(barrier.get("confidence", 0.75)),
+            "description": None,
+            "span_start": None,
+            "span_end": None,
+            "type": barrier.get("barrier_type"),
+            "impact": barrier.get("severity"),
+            "affects_temp_id": barrier.get("affects"),
+            "from_temp_id": None,
+            "to_temp_id": None,
+        })
+
+    for facilitator in result.get("facilitators", []):
+        nodes.append({
+            "temp_id": facilitator.get("temp_id"),
+            "text": facilitator.get("label", ""),
+            "category": "facilitator",
+            "evidence": facilitator.get("evidence_text", ""),
+            "confidence": float(facilitator.get("confidence", 0.75)),
+            "description": None,
+            "span_start": None,
+            "span_end": None,
+            "type": facilitator.get("facilitator_type"),
+            "impact": facilitator.get("impact"),
+            "affects_temp_id": facilitator.get("affects"),
+            "from_temp_id": None,
+            "to_temp_id": None,
+        })
+
+    return nodes
 
 
 def _llm_configured() -> bool:
@@ -86,7 +263,7 @@ def _llm_configured() -> bool:
 
 def _extract_with_llm(
     transcript_text: str, preferred_model: Optional[str] = None
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
         payload = {
@@ -99,6 +276,7 @@ def _extract_with_llm(
                 },
             ],
             "temperature": 0.1,
+            "response_format": {"type": "json_schema", "json_schema": RESPONSE_JSON_SCHEMA},
         }
         request = urllib.request.Request(
             "https://api.openai.com/v1/chat/completions",
@@ -108,7 +286,7 @@ def _extract_with_llm(
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             body = json.loads(response.read().decode("utf-8"))
             content = body["choices"][0]["message"]["content"]
             return _parse_llm_json(content)
@@ -117,7 +295,7 @@ def _extract_with_llm(
     if anthropic_key:
         payload = {
             "model": preferred_model or "claude-3-5-sonnet-latest",
-            "max_tokens": 800,
+            "max_tokens": 4000,
             "system": SYSTEM_PROMPT,
             "messages": [
                 {
@@ -135,7 +313,7 @@ def _extract_with_llm(
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             body = json.loads(response.read().decode("utf-8"))
             content = body["content"][0]["text"]
             return _parse_llm_json(content)
@@ -143,17 +321,13 @@ def _extract_with_llm(
     raise RuntimeError("No LLM API key configured")
 
 
-def _parse_llm_json(content: str) -> list[dict[str, Any]]:
+def _parse_llm_json(content: str) -> dict[str, Any]:
     cleaned = content.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
     data = json.loads(cleaned)
-    if isinstance(data, dict) and "nodes" in data:
-        return data["nodes"]
-    if isinstance(data, list):
-        return data
-    return []
+    return data if isinstance(data, dict) else {}
 
 
 def _extract_with_rules(transcript_text: str) -> list[dict[str, Any]]:

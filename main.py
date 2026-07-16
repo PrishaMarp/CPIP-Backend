@@ -36,7 +36,7 @@ class TranscriptOut(BaseModel):
 
 class Stage1Node(BaseModel):
     text: str
-    category: Literal["state", "event", "barrier", "facilitator", "touch_point"]
+    category: Literal["state", "transition", "event", "barrier", "facilitator", "touch_point"]
     evidence: str
     confidence: float
 
@@ -197,6 +197,9 @@ def _nearest_state_id(index: int, state_positions: list[tuple[int, str]]) -> Opt
     return state_positions[0][1]
 
 
+IMPACT_COLUMNS = {"barriers": "severity", "facilitators": "impact"}
+
+
 def _insert_entity(
     session_id: UUID,
     table_name: str,
@@ -204,12 +207,18 @@ def _insert_entity(
     type_column: str,
     node: dict,
     affected_state_id: Optional[str] = None,
+    affected_transition_id: Optional[str] = None,
 ) -> str:
-    hints, default_type = TYPE_CLASSIFIERS[table_name]
-    classification_text = f"{node['text']} {node.get('evidence', '')}"
+    if node.get("type"):
+        type_value = node["type"]
+    else:
+        hints, default_type = TYPE_CLASSIFIERS[table_name]
+        classification_text = f"{node['text']} {node.get('evidence', '')}"
+        type_value = _classify_enum(classification_text, hints, default_type)
+
     entity_payload = {
         "label": node["text"],
-        type_column: _classify_enum(classification_text, hints, default_type),
+        type_column: type_value,
         "description": node.get("description"),
         "confidence": node.get("confidence"),
         "source_session_id": str(session_id),
@@ -217,11 +226,36 @@ def _insert_entity(
     if table_name in ("barriers", "facilitators"):
         entity_payload["evidence_text"] = node.get("evidence")
         entity_payload["affected_state_id"] = affected_state_id
+        entity_payload["affected_transition_id"] = affected_transition_id
+        if node.get("impact"):
+            entity_payload[IMPACT_COLUMNS[table_name]] = node["impact"]
 
     entity_result = supabase.table(table_name).insert(entity_payload).execute()
     if not entity_result.data:
         raise HTTPException(status_code=500, detail=f"Failed to save {table_name}")
     return entity_result.data[0][id_column]
+
+
+def _insert_transition(
+    session_id: UUID,
+    media_id: UUID,
+    node: dict,
+    from_state_id: str,
+    to_state_id: str,
+) -> str:
+    transition_payload = {
+        "from_state_id": from_state_id,
+        "to_state_id": to_state_id,
+        "transition_type": node.get("type") or "handoff",
+        "risk_level": node.get("impact"),
+        "evidence_text": node.get("evidence"),
+        "confidence": node.get("confidence"),
+        "source_media_id": str(media_id),
+    }
+    result = supabase.table("transitions").insert(transition_payload).execute()
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to save transition")
+    return result.data[0]["transition_id"]
 
 
 def _insert_provenance(
@@ -254,27 +288,56 @@ def save_stage1_nodes(
     raw_nodes: list[dict],
     preferred_model: Optional[str],
 ) -> None:
-    # Pass 1: persist states first so barriers/facilitators can link to one.
-    state_positions: list[tuple[int, str]] = []
+    state_id_by_temp_id: dict[str, str] = {}
+    transition_id_by_temp_id: dict[str, str] = {}
+    state_positions: list[tuple[int, str]] = []  # heuristic-path fallback (no temp_id available)
+
+    # Pass 1: states first, so transitions/barriers/facilitators can link to one.
     for index, node in enumerate(raw_nodes):
         if node["category"] != "state":
             continue
         state_id = _insert_entity(session_id, "states", "state_id", "state_type", node)
         _insert_provenance(session_id, media_id, media_type, node, "state_id", state_id, preferred_model)
+        if node.get("temp_id"):
+            state_id_by_temp_id[node["temp_id"]] = state_id
         state_positions.append((index, state_id))
 
-    # Pass 2: barriers/facilitators, linked to the nearest state.
+    # Pass 2: transitions, resolved via from_temp_id/to_temp_id (both required by DB).
+    for node in raw_nodes:
+        if node["category"] != "transition":
+            continue
+        from_state_id = state_id_by_temp_id.get(node.get("from_temp_id"))
+        to_state_id = state_id_by_temp_id.get(node.get("to_temp_id"))
+        if not from_state_id or not to_state_id:
+            continue  # can't satisfy the required from/to state foreign keys
+
+        transition_id = _insert_transition(session_id, media_id, node, from_state_id, to_state_id)
+        _insert_provenance(
+            session_id, media_id, media_type, node, "transition_id", transition_id, preferred_model
+        )
+        if node.get("temp_id"):
+            transition_id_by_temp_id[node["temp_id"]] = transition_id
+
+    # Pass 3: barriers/facilitators, linked to whichever state/transition they affect.
     for index, node in enumerate(raw_nodes):
         if node["category"] not in ("barrier", "facilitator"):
             continue
 
-        affected_state_id = _nearest_state_id(index, state_positions)
-        if affected_state_id is None:
-            continue  # no state to satisfy the affects-something constraint
+        affects_temp_id = node.get("affects_temp_id")
+        affected_state_id = state_id_by_temp_id.get(affects_temp_id)
+        affected_transition_id = transition_id_by_temp_id.get(affects_temp_id)
+
+        if not affected_state_id and not affected_transition_id:
+            # heuristic path (no temp_id relationships available): fall back
+            # to linking to the nearest preceding state in the transcript.
+            affected_state_id = _nearest_state_id(index, state_positions)
+            if affected_state_id is None:
+                continue  # nothing to satisfy the affects-something constraint
 
         table_name, id_column, type_column = ENTITY_TABLES[node["category"]]
         entity_id = _insert_entity(
-            session_id, table_name, id_column, type_column, node, affected_state_id=affected_state_id
+            session_id, table_name, id_column, type_column, node,
+            affected_state_id=affected_state_id, affected_transition_id=affected_transition_id,
         )
         _insert_provenance(session_id, media_id, media_type, node, id_column, entity_id, preferred_model)
 
